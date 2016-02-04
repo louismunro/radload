@@ -1,8 +1,10 @@
 package main
 
 import (
+	"encoding/csv"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 )
@@ -10,12 +12,23 @@ import (
 func main() {
 
 	workersPtr := flag.Int("w", 1, "number of workers to run concurrently")
-	//csvPtr := flag.String("f", 1, "path to csv file from which username and password will be read")
+	csvPtr := flag.String("f", "/tmp/radload/up.csv", "path to csv file from which username and password will be read")
 	flag.Parse()
-	fmt.Println("tail:", flag.Args())
+
+	// read usernames/passwords from csv and generate conf files
+	file, err := os.Open(*csvPtr)
+	if err != nil {
+		os.Exit(1)
+	}
+	r := csv.NewReader(io.Reader(file))
+	records, err := r.ReadAll()
+	if err != nil {
+		os.Exit(1)
+	}
+	fmt.Print(records)
+	//	_ = "breakpoint"
 
 	var sem = make(chan int, *workersPtr)
-	//	_ = "breakpoint"
 	for {
 		sem <- 1 // add to the semaphore, will block if > than workersPtr
 		go authenticate(sem, flag.Args())
