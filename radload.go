@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"text/template"
 )
 
 func main() {
@@ -25,8 +26,44 @@ func main() {
 	if err != nil {
 		os.Exit(1)
 	}
-	fmt.Print(records)
-	//	_ = "breakpoint"
+
+	tmpStr := `
+network={
+        ssid="EXAMPLE-SSID"
+        key_mgmt=WPA-EAP
+        eap=PEAP
+        identity="{{.Identity}}"
+        anonymous_identity="anonymous"
+        password="{{.Password}}"
+        phase2="autheap=MSCHAPV2"
+
+	#  Uncomment the following to perform server certificate validation.
+#	ca_cert="/root/ca.crt"
+}
+`
+	tmpl, err := template.New("peap").Parse(tmpStr)
+	if err != nil {
+		os.Exit(3)
+	}
+
+	type User struct {
+		Password string
+		Identity string
+	}
+
+	for _, record := range records {
+		username, pass := record[0], record[1]
+		nextUser := User{username, pass}
+
+		f, err := os.Create(username)
+		err = tmpl.Execute(f, nextUser)
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	_ = "breakpoint"
+	os.Exit(3)
 
 	var sem = make(chan int, *workersPtr)
 	for {
