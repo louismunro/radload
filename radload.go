@@ -1,31 +1,43 @@
 package main
 
 import (
+	crypto "crypto/rand"
 	"encoding/csv"
 	"flag"
 	"fmt"
 	"io"
-	"math/rand"
+	mrand "math/rand"
 	"os"
 	"os/exec"
 	"text/template"
 )
 
-var macs = make([]string, 0)
+var macs []string
+var users []string
+var logfile *os.File
+var lock = make(chan int, 1)
+
+type User struct {
+	Identity string
+	Password string
+}
 
 func main() {
 
 	workersPtr := flag.Int("w", 1, "number of workers to run concurrently")
 	csvPtr := flag.String("f", "radload.csv", "path to csv file from which username and password will be read")
 	dirPtr := flag.String("d", "/tmp/.radload", "path to directory where to store the temporary configuration files")
+	logPtr := flag.String("l", "radload.log", "path to log file")
 	macsPtr := flag.Int("m", 0, "generate a list of 'm' random MAC addresses and use them as Calling-Station-Id values")
 	flag.Parse()
+
+	var err error
+	logfile, err = os.Create(*logPtr)
 
 	if *macsPtr > 0 {
 		for i := 0; i < *macsPtr; i++ {
 			macs = append(macs, genMAC())
 		}
-		_ = "breakpoint"
 	}
 
 	// read usernames/passwords from csv and generate conf files
@@ -38,6 +50,7 @@ func main() {
 	if err != nil {
 		os.Exit(1)
 	}
+	file.Close()
 
 	// create the directory
 	err = os.MkdirAll(*dirPtr, 0700)
@@ -64,13 +77,9 @@ network={
 		os.Exit(3)
 	}
 
-	type User struct {
-		Password string
-		Identity string
-	}
-
 	for _, record := range records {
 		username, pass := record[0], record[1]
+		users = append(users, username)
 		nextUser := User{username, pass}
 
 		f, err := os.Create(username)
@@ -78,10 +87,8 @@ network={
 		if err != nil {
 			panic(err)
 		}
+		f.Close()
 	}
-
-	_ = "breakpoint"
-	os.Exit(3)
 
 	var sem = make(chan int, *workersPtr)
 	for {
@@ -91,20 +98,32 @@ network={
 }
 
 func authenticate(sem chan int, macs []string, Args []string) {
-	cmd := "eapol_test"
+	user := users[mrand.Intn(len(users))] // pick a random user
+	Args = append(Args, "-c"+user)
 
+	var mac string
 	if len(macs) > 0 {
-		i := rand.Intn(len(macs) - 1)
-		mac := macs[i]
-		Args := append(Args, CallingStationID(mac))
-	}
+		i := mrand.Intn(len(macs))
 
-	if err := exec.Command(cmd, Args...).Run(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		fmt.Println("Authentication failed")
-	} else {
-		fmt.Println("Authentication successful")
+		mac = macs[i]
+		Args = append(Args, CallingStationID(mac))
 	}
+	_ = "breakpoint"
+
+	cmd := "eapol_test"
+	err := exec.Command(cmd, Args...).Run()
+
+	var status string
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		status = "failed"
+	} else {
+		status = "successful"
+	}
+	lock <- 1 //  lock the logfile
+	result := fmt.Sprintf("[%v / %v] %v authentication\n", user, mac, status)
+	io.WriteString(logfile, result)
+	<-lock //  unlock the logfile
 
 	<-sem // clear the semaphore
 }
@@ -112,7 +131,7 @@ func authenticate(sem chan int, macs []string, Args []string) {
 // generate a fake MAC address
 func genMAC() string {
 	buf := make([]byte, 6)
-	_, err := rand.Read(buf)
+	_, err := crypto.Read(buf)
 	if err != nil {
 		panic(err)
 	}
