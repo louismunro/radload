@@ -9,7 +9,10 @@ import (
 	mrand "math/rand"
 	"os"
 	"os/exec"
+	"os/signal"
+	"syscall"
 	"text/template"
+	"time"
 )
 
 var macs []string
@@ -22,7 +25,32 @@ type User struct {
 	Password string
 }
 
+type Stats struct {
+	requests   uint64
+	success    uint64
+	failures   uint64
+	timeouts   uint64
+	longuest   time.Duration
+	shortest   time.Duration
+	avg        time.Duration
+	median     time.Duration
+	start_time time.Time
+	times      []time.Duration
+}
+
+var stats Stats
+
 func main() {
+
+	stats.start_time = time.Now()
+	// signal handling
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		_ = <-sigs
+		printStats()
+		os.Exit(0)
+	}()
 
 	workersPtr := flag.Int("w", 1, "number of workers to run concurrently")
 	csvPtr := flag.String("f", "radload.csv", "path to csv file from which username and password will be read")
@@ -90,6 +118,7 @@ network={
 		f.Close()
 	}
 
+	// add a call to make sure eapol_test is installed.
 	var sem = make(chan int, *workersPtr)
 	for {
 		sem <- 1 // add to the semaphore, will block if > than workersPtr
@@ -111,19 +140,37 @@ func authenticate(sem chan int, macs []string, Args []string) {
 	_ = "breakpoint"
 
 	cmd := "eapol_test"
-	err := exec.Command(cmd, Args...).Run()
+	before := time.Now()
+	cmdErr := exec.Command(cmd, Args...).Run()
+	after := time.Now()
+	diff := after.Sub(before)
 
 	var status string
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+	if cmdErr != nil {
+		//	fmt.Fprintln(os.Stderr, cmdErr)
 		status = "failed"
 	} else {
 		status = "successful"
 	}
-	lock <- 1 //  lock the logfile
-	result := fmt.Sprintf("[%v / %v] %v authentication\n", user, mac, status)
+
+	lock <- 1 //  lock the shared data structures
+	stats.requests++
+	if diff > stats.longuest {
+		stats.longuest = diff
+	}
+	if (stats.shortest == 0) || (stats.shortest > diff) {
+		stats.shortest = diff
+	}
+	if status != "successful" {
+		stats.failures++
+	} else {
+		stats.success++
+	}
+	stats.times = append(stats.times, diff)
+
+	result := fmt.Sprintf("[%v / %v] %v authentication. Duration %v s\n", user, mac, status, diff.Seconds())
 	io.WriteString(logfile, result)
-	<-lock //  unlock the logfile
+	<-lock //  unlock the shared data
 
 	<-sem // clear the semaphore
 }
@@ -149,4 +196,16 @@ func check(e error) {
 func CallingStationID(mac string) string {
 	// Calling-Station-Id is attribute 31, and sent as a string ("s")
 	return "-N31:s:" + mac
+}
+
+func printStats() {
+	fmt.Printf("Run finished\n")
+	fmt.Printf("============= Statistics =======================\n")
+	fmt.Printf("")
+	fmt.Printf("Total running time: %v \n", time.Now().Sub(stats.start_time))
+	fmt.Printf("Total requests handled: %v \n", stats.requests)
+	fmt.Printf("Successful authentications : %v \n", stats.success)
+	fmt.Printf("Failed authentications : %v \n", stats.failures)
+	fmt.Printf("Longuest authentication: %v \n", stats.longuest)
+	fmt.Printf("Shortest authentication: %v \n", stats.shortest)
 }
