@@ -44,8 +44,11 @@ type Stats struct {
 }
 
 var stats Stats
+var cleanPtr *bool
+var dirPtr *string
 
 const cmd string = "eapol_test"
+const confSuffix = ".rl_conf" // appended to all configfiles created
 
 func main() {
 
@@ -55,18 +58,36 @@ func main() {
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		_ = <-sigs
-		printStats()
-		os.Exit(0)
+		atExit(0)
 	}()
 
 	workersPtr := flag.Int("w", 1, "number of workers to run concurrently (defaults to 1)")
 	csvPtr := flag.String("f", "radload.csv", "path to csv file from which username and password will be read")
-	dirPtr := flag.String("d", "/tmp/.radload", "path to directory where to store the temporary configuration files")
+	dirPtr = flag.String("d", "/tmp/.radload", "path to directory where to store the temporary configuration files")
 	logPtr := flag.String("l", "radload.log", "path to log file")
 	macsPtr := flag.Int("m", 0, "generate a list of 'm' random MAC addresses and use them as Calling-Station-Id values")
-	//countPtr := flag.Int("r", 0, "run a maximum of 'r' requests before exiting (defaults to infinity)")
+	countPtr := flag.Uint64("r", 0, "run a maximum of 'r' requests before exiting (defaults to infinity)")
 	timePtr := flag.Int("t", 0, "run for a maximum of 't' seconds before exiting (defaults to infinity)")
+	cleanPtr = flag.Bool("c", false, "Cleanup. Deletes all configuration files at exit.")
 	flag.Parse()
+
+	/*
+	  -c<conf> = configuration file
+	  -a<AS IP> = IP address of the authentication server, default 127.0.0.1
+	  -p<AS port> = UDP port of the authentication server, default 1812
+	  -s<AS secret> = shared secret with the authentication server, default 'radius'
+	  -A<client IP> = IP address of the client, default: select automatically
+	  -r<count> = number of re-authentications
+	  -W = wait for a control interface monitor before starting
+	  -S = save configuration after authentication
+	  -n = no MPPE keys expected
+	  -t<timeout> = sets timeout in seconds (default: 30 s)
+	  -C<Connect-Info> = RADIUS Connect-Info (default: CONNECT 11Mbps 802.11b)
+	  -M<client MAC address> = Set own MAC address (Calling-Station-Id,
+	                           default: 02:00:00:00:00:01)
+	  -o<server cert file> = Write received server certificate
+	                         chain to the specified file
+	*/
 
 	// exit early if the command is not found
 	_, err := exec.LookPath(cmd)
@@ -80,7 +101,7 @@ func main() {
 		go func() {
 			time.Sleep(time.Duration(*timePtr) * time.Second)
 			fmt.Fprintf(os.Stderr, "Time's up. Exiting.\n")
-			os.Exit(0)
+			atExit(0)
 		}()
 	}
 
@@ -94,7 +115,7 @@ func main() {
 
 	confTemplate := confTmp{
 		peap: `
-		network={
+			network={
 				ssid="EXAMPLE-SSID"
 				key_mgmt=WPA-EAP
 				eap=PEAP
@@ -103,22 +124,31 @@ func main() {
 				password="{{.Password}}"
 				phase2="autheap=MSCHAPV2"
 
-			#  Uncomment the following to perform server certificate validation.
-		#	ca_cert="/root/ca.crt"
+				#  Uncomment the following to perform server certificate validation.
+				#	ca_cert="/root/ca.crt"
 		}`,
-		tls: "",
+		tls: `
+		  network={
+			  ssid="YOUR-SSID"
+			  scan_ssid=1
+			  key_mgmt=WPA-EAP
+			  pairwise=CCMP TKIP
+			  group=CCMP TKIP
+			  eap=TLS
+			  identity="{{.Identity}}"
+			  ca_cert="/etc/certs/cacert.pem"
+			  client_cert="/etc/certs/cert.pem"
+			  private_key="/etc/certs/key.pem"
+			  private_key_passwd="{{.Password}}"
+   		}`,
 	}
 
 	// read usernames/passwords from csv and generate conf files
 	file, err := os.Open(*csvPtr)
-	if err != nil {
-		os.Exit(1)
-	}
+	check(err)
 	r := csv.NewReader(io.Reader(file))
 	records, err := r.ReadAll()
-	if err != nil {
-		os.Exit(1)
-	}
+	check(err)
 	file.Close()
 
 	// create the directory
@@ -129,7 +159,7 @@ func main() {
 
 	tmpl, err := template.New("eapconfig").Parse(confTemplate.peap)
 	if err != nil {
-		os.Exit(3)
+		check(err)
 	}
 
 	for _, record := range records {
@@ -137,7 +167,8 @@ func main() {
 		users = append(users, username)
 		nextUser := user{username, pass}
 
-		f, err := os.Create(username)
+		f, err := os.Create(username + confSuffix)
+		check(err)
 		err = tmpl.Execute(f, nextUser)
 		if err != nil {
 			panic(err)
@@ -145,12 +176,15 @@ func main() {
 		f.Close()
 	}
 
-	// add a call to make sure eapol_test is installed.
 	var sem = make(chan int, *workersPtr)
 	for {
 		sem <- 1 // add to the semaphore, will block if > than workersPtr
-		// exit if maximum number of requests reached
-		//if stats.requests =>
+
+		if (*countPtr != 0) && (stats.requests >= *countPtr) {
+			fmt.Fprintf(os.Stderr, "Maximum requests reached. Exiting.\n")
+			printStats()
+			os.Exit(0)
+		}
 		go authenticate(sem, macs, flag.Args())
 	}
 }
@@ -164,7 +198,7 @@ func authenticate(sem chan int, macs []string, Args []string) {
 		i := mrand.Intn(len(macs))
 
 		mac = macs[i]
-		Args = append(Args, CallingStationID(mac))
+		Args = append(Args, fmt.Sprintf("-M%v", mac))
 	}
 	_ = "breakpoint"
 
@@ -218,23 +252,33 @@ func genMAC() string {
 
 func check(e error) {
 	if e != nil {
-		panic(e)
+		fmt.Fprintf(os.Stderr, "%v", e)
+		os.Exit(1)
 	}
 }
 
-func CallingStationID(mac string) string {
-	// Calling-Station-Id is attribute 31, and sent as a string ("s")
-	return "-N31:s:" + mac
+func atExit(status int) {
+	printStats()
+	cleanUp()
+	os.Exit(status)
 }
 
 func printStats() {
 	fmt.Printf("Run finished\n")
 	fmt.Printf("============= Statistics =======================\n")
-	fmt.Printf("")
+	fmt.Printf("\n")
 	fmt.Printf("Total running time: %v \n", time.Now().Sub(stats.start_time))
 	fmt.Printf("Total requests handled: %v \n", stats.requests)
 	fmt.Printf("Successful authentications : %v \n", stats.success)
 	fmt.Printf("Failed authentications : %v \n", stats.failures)
 	fmt.Printf("Longuest authentication: %v \n", stats.longuest)
 	fmt.Printf("Shortest authentication: %v \n", stats.shortest)
+}
+
+func cleanUp() {
+	if *cleanPtr {
+		for _, user := range users {
+			os.Remove(*dirPtr + "/" + user + confSuffix)
+		}
+	}
 }
