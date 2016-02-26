@@ -20,9 +20,14 @@ var users []string
 var logfile *os.File
 var lock = make(chan int, 1)
 
-type User struct {
+type user struct {
 	Identity string
 	Password string
+}
+
+type confTmp struct {
+	peap string
+	tls  string
 }
 
 type Stats struct {
@@ -40,6 +45,8 @@ type Stats struct {
 
 var stats Stats
 
+const cmd string = "eapol_test"
+
 func main() {
 
 	stats.start_time = time.Now()
@@ -52,20 +59,54 @@ func main() {
 		os.Exit(0)
 	}()
 
-	workersPtr := flag.Int("w", 1, "number of workers to run concurrently")
+	workersPtr := flag.Int("w", 1, "number of workers to run concurrently (defaults to 1)")
 	csvPtr := flag.String("f", "radload.csv", "path to csv file from which username and password will be read")
 	dirPtr := flag.String("d", "/tmp/.radload", "path to directory where to store the temporary configuration files")
 	logPtr := flag.String("l", "radload.log", "path to log file")
 	macsPtr := flag.Int("m", 0, "generate a list of 'm' random MAC addresses and use them as Calling-Station-Id values")
+	//countPtr := flag.Int("r", 0, "run a maximum of 'r' requests before exiting (defaults to infinity)")
+	timePtr := flag.Int("t", 0, "run for a maximum of 't' seconds before exiting (defaults to infinity)")
 	flag.Parse()
 
-	var err error
+	// exit early if the command is not found
+	_, err := exec.LookPath(cmd)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v not found in PATH or not executable. Exiting.\n", cmd)
+		os.Exit(2)
+	}
+
+	// take care of maximum running time
+	if *timePtr > 0 {
+		go func() {
+			time.Sleep(time.Duration(*timePtr) * time.Second)
+			fmt.Fprintf(os.Stderr, "Time's up. Exiting.\n")
+			os.Exit(0)
+		}()
+	}
+
 	logfile, err = os.Create(*logPtr)
 
 	if *macsPtr > 0 {
 		for i := 0; i < *macsPtr; i++ {
 			macs = append(macs, genMAC())
 		}
+	}
+
+	confTemplate := confTmp{
+		peap: `
+		network={
+				ssid="EXAMPLE-SSID"
+				key_mgmt=WPA-EAP
+				eap=PEAP
+				identity="{{.Identity}}"
+				anonymous_identity="anonymous"
+				password="{{.Password}}"
+				phase2="autheap=MSCHAPV2"
+
+			#  Uncomment the following to perform server certificate validation.
+		#	ca_cert="/root/ca.crt"
+		}`,
+		tls: "",
 	}
 
 	// read usernames/passwords from csv and generate conf files
@@ -86,21 +127,7 @@ func main() {
 	err = os.Chdir(*dirPtr)
 	check(err)
 
-	tmpStr := `
-network={
-        ssid="EXAMPLE-SSID"
-        key_mgmt=WPA-EAP
-        eap=PEAP
-        identity="{{.Identity}}"
-        anonymous_identity="anonymous"
-        password="{{.Password}}"
-        phase2="autheap=MSCHAPV2"
-
-	#  Uncomment the following to perform server certificate validation.
-#	ca_cert="/root/ca.crt"
-}
-`
-	tmpl, err := template.New("eapconfig").Parse(tmpStr)
+	tmpl, err := template.New("eapconfig").Parse(confTemplate.peap)
 	if err != nil {
 		os.Exit(3)
 	}
@@ -108,7 +135,7 @@ network={
 	for _, record := range records {
 		username, pass := record[0], record[1]
 		users = append(users, username)
-		nextUser := User{username, pass}
+		nextUser := user{username, pass}
 
 		f, err := os.Create(username)
 		err = tmpl.Execute(f, nextUser)
@@ -122,6 +149,8 @@ network={
 	var sem = make(chan int, *workersPtr)
 	for {
 		sem <- 1 // add to the semaphore, will block if > than workersPtr
+		// exit if maximum number of requests reached
+		//if stats.requests =>
 		go authenticate(sem, macs, flag.Args())
 	}
 }
@@ -139,7 +168,6 @@ func authenticate(sem chan int, macs []string, Args []string) {
 	}
 	_ = "breakpoint"
 
-	cmd := "eapol_test"
 	before := time.Now()
 	cmdErr := exec.Command(cmd, Args...).Run()
 	after := time.Now()
@@ -170,6 +198,7 @@ func authenticate(sem chan int, macs []string, Args []string) {
 
 	result := fmt.Sprintf("[%v / %v] %v authentication. Duration %v s\n", user, mac, status, diff.Seconds())
 	io.WriteString(logfile, result)
+
 	<-lock //  unlock the shared data
 
 	<-sem // clear the semaphore
