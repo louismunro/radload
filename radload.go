@@ -5,6 +5,7 @@ import (
 	"encoding/csv"
 	"flag"
 	"fmt"
+	"github.com/montanaflynn/stats"
 	"io"
 	mrand "math/rand"
 	"os"
@@ -15,44 +16,45 @@ import (
 	"time"
 )
 
-var macs []string
-var users []string
-var logfile *os.File
-var lock = make(chan int, 1)
+type (
+	user struct {
+		Identity string
+		Password string
+	}
 
-type user struct {
-	Identity string
-	Password string
-}
+	confTmp struct {
+		peap string
+		tls  string
+	}
 
-type confTmp struct {
-	peap string
-	tls  string
-}
+	rl_stats struct {
+		requests   uint64
+		success    uint64
+		failures   uint64
+		timeouts   uint64
+		start_time time.Time
+		times      []float64
+	}
+)
 
-type Stats struct {
-	requests   uint64
-	success    uint64
-	failures   uint64
-	timeouts   uint64
-	longuest   time.Duration
-	shortest   time.Duration
-	avg        time.Duration
-	median     time.Duration
-	start_time time.Time
-	times      []time.Duration
-}
+var (
+	macs     []string
+	users    []string
+	logfile  *os.File
+	lock     = make(chan int, 1)
+	reqstats rl_stats
+	cleanPtr *bool
+	dirPtr   *string
+)
 
-var stats Stats
-var cleanPtr *bool
-var dirPtr *string
-
-const cmd string = "eapol_test"
-const confSuffix = ".rl_conf" // appended to all configfiles created
+const (
+	cmd        string = "eapol_test"
+	confSuffix        = ".rl_conf" // appended to all configfiles created
+)
 
 func main() {
 
-	stats.start_time = time.Now()
+	reqstats.start_time = time.Now()
 	// signal handling
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
@@ -72,6 +74,8 @@ func main() {
 	flag.Parse()
 
 	/*
+
+	  EAPOL_TEST flags
 	  -c<conf> = configuration file
 	  -a<AS IP> = IP address of the authentication server, default 127.0.0.1
 	  -p<AS port> = UDP port of the authentication server, default 1812
@@ -180,7 +184,7 @@ func main() {
 	for {
 		sem <- 1 // add to the semaphore, will block if > than workersPtr
 
-		if (*countPtr != 0) && (stats.requests >= *countPtr) {
+		if (*countPtr != 0) && (reqstats.requests >= *countPtr) {
 			fmt.Fprintf(os.Stderr, "Maximum requests reached. Exiting.\n")
 			printStats()
 			os.Exit(0)
@@ -191,7 +195,7 @@ func main() {
 
 func authenticate(sem chan int, macs []string, Args []string) {
 	user := users[mrand.Intn(len(users))] // pick a random user
-	Args = append(Args, "-c"+user)
+	Args = append(Args, "-c"+user+".rl_conf")
 
 	var mac string
 	if len(macs) > 0 {
@@ -200,37 +204,32 @@ func authenticate(sem chan int, macs []string, Args []string) {
 		mac = macs[i]
 		Args = append(Args, fmt.Sprintf("-M%v", mac))
 	}
-	_ = "breakpoint"
 
 	before := time.Now()
 	cmdErr := exec.Command(cmd, Args...).Run()
-	after := time.Now()
-	diff := after.Sub(before)
+	diff := time.Since(before).Seconds()
 
 	var status string
+	var failed bool
 	if cmdErr != nil {
 		//	fmt.Fprintln(os.Stderr, cmdErr)
 		status = "failed"
+		failed = true
 	} else {
+		failed = false
 		status = "successful"
 	}
 
 	lock <- 1 //  lock the shared data structures
-	stats.requests++
-	if diff > stats.longuest {
-		stats.longuest = diff
-	}
-	if (stats.shortest == 0) || (stats.shortest > diff) {
-		stats.shortest = diff
-	}
-	if status != "successful" {
-		stats.failures++
+	reqstats.requests++
+	if failed {
+		reqstats.failures++
 	} else {
-		stats.success++
+		reqstats.success++
 	}
-	stats.times = append(stats.times, diff)
+	reqstats.times = append(reqstats.times, diff)
 
-	result := fmt.Sprintf("[%v / %v] %v authentication. Duration %v s\n", user, mac, status, diff.Seconds())
+	result := fmt.Sprintf("[%v / %v] %v authentication. Duration %v s\n", user, mac, status, diff)
 	io.WriteString(logfile, result)
 
 	<-lock //  unlock the shared data
@@ -265,14 +264,21 @@ func atExit(status int) {
 
 func printStats() {
 	fmt.Printf("Run finished\n")
+
+	max, _ := stats.Max(reqstats.times)
+	min, _ := stats.Min(reqstats.times)
+	median, _ := stats.Median(reqstats.times)
+	_ = "breakpoint"
+
 	fmt.Printf("============= Statistics =======================\n")
 	fmt.Printf("\n")
-	fmt.Printf("Total running time: %v \n", time.Now().Sub(stats.start_time))
-	fmt.Printf("Total requests handled: %v \n", stats.requests)
-	fmt.Printf("Successful authentications : %v \n", stats.success)
-	fmt.Printf("Failed authentications : %v \n", stats.failures)
-	fmt.Printf("Longuest authentication: %v \n", stats.longuest)
-	fmt.Printf("Shortest authentication: %v \n", stats.shortest)
+	fmt.Printf("Total running time: %v \n", time.Now().Sub(reqstats.start_time))
+	fmt.Printf("Total requests handled: %v \n", reqstats.requests)
+	fmt.Printf("Successful authentications : %v \n", reqstats.success)
+	fmt.Printf("Failed authentications : %v \n", reqstats.failures)
+	fmt.Printf("Longuest authentication: %v s\n", max)
+	fmt.Printf("Shortest authentication: %v s\n", min)
+	fmt.Printf("Median authentication time: %v s\n", median)
 }
 
 func cleanUp() {
