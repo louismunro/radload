@@ -35,16 +35,28 @@ type (
 		start_time time.Time
 		times      []float64
 	}
+
+	rl_config struct {
+		workers uint64
+		csv     string
+		dir     string
+		log     string
+		MACs    uint64
+		maxreq  uint64
+		maxtime uint64
+		clean   bool
+		conf    string
+	}
 )
 
 var (
 	macs     []string
-	users    []string
 	logfile  *os.File
 	lock     = make(chan int, 1)
 	reqstats rl_stats
-	cleanPtr *bool
-	dirPtr   *string
+	users    []string
+	Config   rl_config
+	cliArgs  []string
 )
 
 const (
@@ -63,16 +75,7 @@ func main() {
 		atExit(0)
 	}()
 
-	workersPtr := flag.Int("w", 1, "number of workers to run concurrently (defaults to 1)")
-	csvPtr := flag.String("f", "radload.csv", "path to csv file from which username and password will be read")
-	dirPtr = flag.String("d", "/tmp/.radload", "path to directory where to store the temporary configuration files")
-	logPtr := flag.String("l", "radload.log", "path to log file")
-	macsPtr := flag.Int("m", 0, "generate a list of 'm' random MAC addresses and use them as Calling-Station-Id values")
-	countPtr := flag.Uint64("r", 0, "run a maximum of 'r' requests before exiting (defaults to infinity)")
-	timePtr := flag.Int("t", 0, "run for a maximum of 't' seconds before exiting (defaults to infinity)")
-	cleanPtr = flag.Bool("c", false, "Cleanup. Deletes all configuration files at exit.")
-	flag.Parse()
-
+	setConfig()
 	/*
 
 	  EAPOL_TEST flags
@@ -101,18 +104,18 @@ func main() {
 	}
 
 	// take care of maximum running time
-	if *timePtr > 0 {
+	if Config.maxtime > 0 {
 		go func() {
-			time.Sleep(time.Duration(*timePtr) * time.Second)
+			time.Sleep(time.Duration(Config.maxtime) * time.Second)
 			fmt.Fprintf(os.Stderr, "Time's up. Exiting.\n")
 			atExit(0)
 		}()
 	}
 
-	logfile, err = os.Create(*logPtr)
+	logfile, err = os.Create(Config.log)
 
-	if *macsPtr > 0 {
-		for i := 0; i < *macsPtr; i++ {
+	if Config.MACs > 0 {
+		for i := uint64(0); i < Config.MACs; i++ {
 			macs = append(macs, genMAC())
 		}
 	}
@@ -148,7 +151,7 @@ func main() {
 	}
 
 	// read usernames/passwords from csv and generate conf files
-	file, err := os.Open(*csvPtr)
+	file, err := os.Open(Config.csv)
 	check(err)
 	r := csv.NewReader(io.Reader(file))
 	records, err := r.ReadAll()
@@ -156,9 +159,9 @@ func main() {
 	file.Close()
 
 	// create the directory
-	err = os.MkdirAll(*dirPtr, 0700)
+	err = os.MkdirAll(Config.dir, 0700)
 	check(err)
-	err = os.Chdir(*dirPtr)
+	err = os.Chdir(Config.dir)
 	check(err)
 
 	tmpl, err := template.New("eapconfig").Parse(confTemplate.peap)
@@ -180,33 +183,33 @@ func main() {
 		f.Close()
 	}
 
-	var sem = make(chan int, *workersPtr)
+	var sem = make(chan int, Config.workers)
 	for {
 		sem <- 1 // add to the semaphore, will block if > than workersPtr
 
-		if (*countPtr != 0) && (reqstats.requests >= *countPtr) {
+		if (Config.maxreq != 0) && (reqstats.requests >= Config.maxreq) {
 			fmt.Fprintf(os.Stderr, "Maximum requests reached. Exiting.\n")
 			printStats()
 			os.Exit(0)
 		}
-		go authenticate(sem, macs, flag.Args())
+		go authenticate(sem)
 	}
 }
 
-func authenticate(sem chan int, macs []string, Args []string) {
+func authenticate(sem chan int) {
 	user := users[mrand.Intn(len(users))] // pick a random user
-	Args = append(Args, "-c"+user+".rl_conf")
+	cliArgs = append(cliArgs, "-c"+user+".rl_conf")
 
 	var mac string
 	if len(macs) > 0 {
 		i := mrand.Intn(len(macs))
 
 		mac = macs[i]
-		Args = append(Args, fmt.Sprintf("-M%v", mac))
+		cliArgs = append(cliArgs, fmt.Sprintf("-M%v", mac))
 	}
 
 	before := time.Now()
-	cmdErr := exec.Command(cmd, Args...).Run()
+	cmdErr := exec.Command(cmd, cliArgs...).Run()
 	diff := time.Since(before).Seconds()
 
 	var status string
@@ -282,9 +285,40 @@ func printStats() {
 }
 
 func cleanUp() {
-	if *cleanPtr {
+	if Config.clean {
 		for _, user := range users {
-			os.Remove(*dirPtr + "/" + user + confSuffix)
+			os.Remove(Config.dir + "/" + user + confSuffix)
 		}
 	}
+}
+
+func setConfig() {
+
+	confPtr := flag.String("f", "~/.radload.conf", "path to configuration file")
+	workersPtr := flag.Int("w", 1, "number of workers to run concurrently (defaults to 1)")
+	csvPtr := flag.String("x", "radload.csv", "path to csv file from which username and password will be read")
+	dirPtr := flag.String("d", "/tmp/.radload", "path to directory where to store the temporary configuration files")
+	logPtr := flag.String("l", "radload.log", "path to log file")
+	macsPtr := flag.Int("m", 0, "generate a list of 'm' random MAC addresses and use them as Calling-Station-Id values")
+	countPtr := flag.Uint64("r", 0, "run a maximum of 'r' requests before exiting (defaults to infinity)")
+	timePtr := flag.Int("t", 0, "run for a maximum of 't' seconds before exiting (defaults to infinity)")
+	cleanPtr := flag.Bool("c", false, "Cleanup. Deletes all configuration files at exit.")
+	flag.Parse()
+	cliArgs = flag.Args()
+
+	if *confPtr == "~/.radload.conf" {
+		Config.conf = os.Getenv("HOME") + "/.radload.conf"
+	} else {
+		Config.conf = *confPtr
+	}
+
+	Config.workers = uint64(*workersPtr)
+	Config.csv = *csvPtr
+	Config.dir = *dirPtr
+	Config.log = *logPtr
+	Config.MACs = uint64(*macsPtr)
+	Config.maxreq = *countPtr
+	Config.maxtime = uint64(*timePtr)
+	Config.clean = *cleanPtr
+
 }
