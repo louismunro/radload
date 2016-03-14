@@ -57,6 +57,7 @@ var (
 	users    []string
 	Config   rl_config
 	cliArgs  []string
+	usersmac = make(map[string]string)
 )
 
 const (
@@ -171,6 +172,7 @@ func main() {
 
 	for _, record := range records {
 		username, pass := record[0], record[1]
+		usersmac[username] = record[2]
 		users = append(users, username)
 		nextUser := user{username, pass}
 
@@ -200,14 +202,14 @@ func authenticate(sem chan int) {
 	user := users[mrand.Intn(len(users))] // pick a random user
 	cliArgs = append(cliArgs, "-c"+user+".rl_conf")
 
-	var mac string
-	if len(macs) > 0 {
+	mac := usersmac[user]
+	if mac == "" {
 		i := mrand.Intn(len(macs))
-
 		mac = macs[i]
-		cliArgs = append(cliArgs, fmt.Sprintf("-M%v", mac))
 	}
+	cliArgs = append(cliArgs, fmt.Sprintf("-M%v", mac))
 
+	_ = "breakpoint"
 	before := time.Now()
 	cmdErr := exec.Command(cmd, cliArgs...).Run()
 	diff := time.Since(before).Seconds()
@@ -299,7 +301,7 @@ func setConfig() {
 	csvPtr := flag.String("x", "radload.csv", "path to csv file from which username and password will be read")
 	dirPtr := flag.String("d", "/tmp/.radload", "path to directory where to store the temporary configuration files")
 	logPtr := flag.String("l", "radload.log", "path to log file")
-	macsPtr := flag.Int("m", 0, "generate a list of 'm' random MAC addresses and use them as Calling-Station-Id values")
+	macsPtr := flag.Int("m", 10000, "generate a list of 'm' random MAC addresses and use them as Calling-Station-Id values (defaults to 10000)")
 	countPtr := flag.Uint64("r", 0, "run a maximum of 'r' requests before exiting (defaults to infinity)")
 	timePtr := flag.Int("t", 0, "run for a maximum of 't' seconds before exiting (defaults to infinity)")
 	cleanPtr := flag.Bool("c", false, "Cleanup. Deletes all configuration files at exit.")
