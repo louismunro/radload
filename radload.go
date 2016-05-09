@@ -17,14 +17,13 @@ import (
 )
 
 type (
-	user struct {
-		Identity string
-		Password string
-	}
-
-	confTmp struct {
-		peap string
-		tls  string
+	rl_user struct {
+		Identity   string
+		Password   string
+		MAC        string
+		CaCert     string
+		ClientCert string
+		Key        string
 	}
 
 	rl_stats struct {
@@ -36,8 +35,14 @@ type (
 		times      []float64
 	}
 
+	rl_auth struct {
+		authType string // peap, tls, pap
+		fields   int    // how many required fields in config file
+	}
+
 	rl_config struct {
 		workers uint64
+		auth    rl_auth
 		csv     string
 		dir     string
 		log     string
@@ -54,10 +59,9 @@ var (
 	logfile  *os.File
 	lock     = make(chan int, 1)
 	reqstats rl_stats
-	users    []string
+	users    []rl_user
 	Config   rl_config
 	cliArgs  []string
-	usersmac = make(map[string]string)
 )
 
 const (
@@ -121,8 +125,8 @@ func main() {
 		}
 	}
 
-	confTemplate := confTmp{
-		peap: `
+	confTemplate := map[string]string{
+		"peap": `
 			network={
 				ssid="EXAMPLE-SSID"
 				key_mgmt=WPA-EAP
@@ -135,7 +139,7 @@ func main() {
 				#  Uncomment the following to perform server certificate validation.
 				#	ca_cert="/root/ca.crt"
 		}`,
-		tls: `
+		"tls": `
 		  network={
 			  ssid="YOUR-SSID"
 			  scan_ssid=1
@@ -144,9 +148,9 @@ func main() {
 			  group=CCMP TKIP
 			  eap=TLS
 			  identity="{{.Identity}}"
-			  ca_cert="/etc/certs/cacert.pem"
-			  client_cert="/etc/certs/cert.pem"
-			  private_key="/etc/certs/key.pem"
+			  ca_cert="{{.CaCert}}"
+			  client_cert="{{.ClientCert}}"
+			  private_key="{{.Key}}"
 			  private_key_passwd="{{.Password}}"
    		}`,
 	}
@@ -165,18 +169,29 @@ func main() {
 	err = os.Chdir(Config.dir)
 	check(err)
 
-	tmpl, err := template.New("eapconfig").Parse(confTemplate.peap)
+	tmpl, err := template.New("eapconfig").Parse(confTemplate[Config.auth.authType])
 	if err != nil {
 		check(err)
 	}
 
-	for _, record := range records {
-		username, pass := record[0], record[1]
-		usersmac[username] = record[2]
-		users = append(users, username)
-		nextUser := user{username, pass}
+	for line, record := range records {
+		if len(record) < Config.auth.fields {
+			fmt.Fprintf(os.Stderr, "Error reading %s at line %d. Missing field.\n", Config.csv, line)
+			os.Exit(1)
+		}
 
-		f, err := os.Create(username + confSuffix)
+		var nextUser rl_user
+		var identity, password, MAC, CaCert, ClientCert, Key string
+		if Config.auth.authType == "tls" {
+			identity, password, MAC, CaCert, ClientCert, Key = record[0], record[1], record[2], record[3], record[4], record[5]
+			nextUser = rl_user{identity, password, MAC, CaCert, ClientCert, Key}
+		} else {
+			identity, password, MAC = record[0], record[1], record[2]
+			nextUser = rl_user{identity, password, MAC, "", "", ""}
+		}
+		users = append(users, nextUser)
+
+		f, err := os.Create(identity + confSuffix)
 		check(err)
 		err = tmpl.Execute(f, nextUser)
 		if err != nil {
@@ -200,9 +215,9 @@ func main() {
 
 func authenticate(sem chan int) {
 	user := users[mrand.Intn(len(users))] // pick a random user
-	cliArgs = append(cliArgs, "-c"+user+".rl_conf")
+	cliArgs = append(cliArgs, "-c"+user.Identity+".rl_conf")
 
-	mac := usersmac[user]
+	mac := user.MAC
 	if mac == "" {
 		i := mrand.Intn(len(macs))
 		mac = macs[i]
@@ -234,7 +249,7 @@ func authenticate(sem chan int) {
 	}
 	reqstats.times = append(reqstats.times, diff)
 
-	result := fmt.Sprintf("[%v / %v] %v authentication. Duration %v s\n", user, mac, status, diff)
+	result := fmt.Sprintf("[%v / %v] %v authentication. Duration %v s\n", user.Identity, mac, status, diff)
 	io.WriteString(logfile, result)
 
 	<-lock //  unlock the shared data
@@ -289,18 +304,19 @@ func printStats() {
 func cleanUp() {
 	if Config.clean {
 		for _, user := range users {
-			os.Remove(Config.dir + "/" + user + confSuffix)
+			os.Remove(Config.dir + "/" + user.Identity + confSuffix)
 		}
 	}
 }
 
 func setConfig() {
 
-	confPtr := flag.String("f", "~/.radload.conf", "path to configuration file")
+	//	confPtr := flag.String("f", "~/.radload.conf", "path to configuration file")
 	workersPtr := flag.Int("w", 1, "number of workers to run concurrently (defaults to 1)")
 	csvPtr := flag.String("x", "radload.csv", "path to csv file from which username and password will be read")
 	dirPtr := flag.String("d", "/tmp/.radload", "path to directory where to store the temporary configuration files")
 	logPtr := flag.String("l", "radload.log", "path to log file")
+	authPtr := flag.String("a", "", "authentication type to use. \"peap\", \"tls\" or \"pap\". This parameter is mandatory")
 	macsPtr := flag.Int("m", 10000, "generate a list of 'm' random MAC addresses and use them as Calling-Station-Id values (defaults to 10000)")
 	countPtr := flag.Uint64("r", 0, "run a maximum of 'r' requests before exiting (defaults to infinity)")
 	timePtr := flag.Int("t", 0, "run for a maximum of 't' seconds before exiting (defaults to infinity)")
@@ -308,13 +324,21 @@ func setConfig() {
 	flag.Parse()
 	cliArgs = flag.Args()
 
-	if *confPtr == "~/.radload.conf" {
-		Config.conf = os.Getenv("HOME") + "/.radload.conf"
-	} else {
-		Config.conf = *confPtr
-	}
+	/*
+		if *confPtr == "~/.radload.conf" {
+			Config.conf = os.Getenv("HOME") + "/.radload.conf"
+		} else {
+			Config.conf = *confPtr
+		}
+	*/
 
 	Config.workers = uint64(*workersPtr)
+	Config.auth.authType = *authPtr
+	if Config.auth.authType == "tls" {
+		Config.auth.fields = 6
+	} else {
+		Config.auth.fields = 3
+	}
 	Config.csv = *csvPtr
 	Config.dir = *dirPtr
 	Config.log = *logPtr
